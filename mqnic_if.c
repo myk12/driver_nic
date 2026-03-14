@@ -29,14 +29,6 @@ struct mqnic_if *mqnic_create_interface(struct mqnic_dev *mdev, int index, u8 __
 	interface->hw_addr = hw_addr;
 	interface->csr_hw_addr = hw_addr + mdev->if_csr_offset;
 
-	init_rwsem(&interface->eq_table_sem);
-	INIT_RADIX_TREE(&interface->eq_table, GFP_KERNEL);
-
-	INIT_LIST_HEAD(&interface->free_sched_port_list);
-	spin_lock_init(&interface->free_sched_port_list_lock);
-
-	INIT_LIST_HEAD(&interface->ndev_list);
-
 	// Enumerate registers
 	interface->rb_list = mqnic_enumerate_reg_block_list(interface->hw_addr, mdev->if_csr_offset, interface->hw_regs_size);
 	if (!interface->rb_list) {
@@ -265,13 +257,7 @@ struct mqnic_if *mqnic_create_interface(struct mqnic_dev *mdev, int index, u8 __
 			goto fail;
 		}
 
-		down_write(&interface->eq_table_sem);
-		ret = radix_tree_insert(&interface->eq_table, k, eq);
-		up_write(&interface->eq_table_sem);
-		if (ret) {
-			mqnic_destroy_eq(eq);
-			goto fail;
-		}
+		interface->eq[k] = eq;
 
 		ret = mqnic_open_eq(eq, mdev->irq[k % mdev->irq_count], mqnic_num_eq_entries);
 		if (ret)
@@ -281,17 +267,15 @@ struct mqnic_if *mqnic_create_interface(struct mqnic_dev *mdev, int index, u8 __
 	}
 
 	// create net_devices
-	interface->ndev_count = interface->port_count;
+	interface->ndev_count = 1;
 	for (k = 0; k < interface->ndev_count; k++) {
-		struct net_device *ndev;
-		struct mqnic_priv *priv;
-		ndev = mqnic_create_netdev(interface, interface->port[k]);
+		struct net_device *ndev = mqnic_create_netdev(interface, k,
+				interface->port[k], interface->sched_block[k]);
 		if (IS_ERR_OR_NULL(ndev)) {
 			ret = PTR_ERR(ndev);
 			goto fail;
 		}
-		priv = netdev_priv(ndev);
-		list_add_tail(&priv->ndev_list, &interface->ndev_list);
+		interface->ndev[k] = ndev;
 	}
 
 	return interface;
@@ -303,24 +287,23 @@ fail:
 
 void mqnic_destroy_interface(struct mqnic_if *interface)
 {
-	struct mqnic_priv *priv, *priv_safe;
-	struct radix_tree_iter iter;
-	void **slot;
 	int k;
 
 	// destroy associated net_devices
-	list_for_each_entry_safe(priv, priv_safe, &interface->ndev_list, ndev_list) {
-		list_del(&priv->ndev_list);
-		mqnic_destroy_netdev(priv->ndev);
+	for (k = 0; k < ARRAY_SIZE(interface->ndev); k++) {
+		if (interface->ndev[k]) {
+			mqnic_destroy_netdev(interface->ndev[k]);
+			interface->ndev[k] = NULL;
+		}
 	}
 
 	// free EQs
-	down_write(&interface->eq_table_sem);
-	radix_tree_for_each_slot(slot, &interface->eq_table, &iter, 0) {
-		struct mqnic_eq *eq = (struct mqnic_eq *)*slot;
-		mqnic_destroy_eq(eq);
+	for (k = 0; k < ARRAY_SIZE(interface->eq); k++) {
+		if (interface->eq[k]) {
+			mqnic_destroy_eq(interface->eq[k]);
+			interface->eq[k] = NULL;
+		}
 	}
-	up_write(&interface->eq_table_sem);
 
 	// free schedulers
 	for (k = 0; k < ARRAY_SIZE(interface->sched_block); k++) {
@@ -412,44 +395,3 @@ void mqnic_interface_set_rx_queue_map_indir_table(struct mqnic_if *interface, in
 	iowrite32(val, interface->rx_queue_map_indir_table[port] + index*4);
 }
 EXPORT_SYMBOL(mqnic_interface_set_rx_queue_map_indir_table);
-
-int mqnic_interface_register_sched_port(struct mqnic_if *interface, struct mqnic_sched_port *port)
-{
-	spin_lock(&interface->free_sched_port_list_lock);
-	list_add_tail(&port->free_list, &interface->free_sched_port_list);
-	spin_unlock(&interface->free_sched_port_list_lock);
-	return 0;
-}
-
-int mqnic_interface_unregister_sched_port(struct mqnic_if *interface, struct mqnic_sched_port *port)
-{
-	spin_lock(&interface->free_sched_port_list_lock);
-	list_del(&port->free_list);
-	spin_unlock(&interface->free_sched_port_list_lock);
-	return 0;
-}
-
-struct mqnic_sched_port *mqnic_interface_alloc_sched_port(struct mqnic_if *interface)
-{
-	struct mqnic_sched_port *port = NULL;
-
-	spin_lock(&interface->free_sched_port_list_lock);
-
-	port = list_first_entry_or_null(&interface->free_sched_port_list, struct mqnic_sched_port, free_list);
-
-	if (port)
-		list_del(&port->free_list);
-
-	spin_unlock(&interface->free_sched_port_list_lock);
-
-	return port;
-}
-
-void mqnic_interface_free_sched_port(struct mqnic_if *interface, struct mqnic_sched_port *port)
-{
-	if (!port)
-		return;
-	spin_lock(&interface->free_sched_port_list_lock);
-	list_add_tail(&port->free_list, &interface->free_sched_port_list);
-	spin_unlock(&interface->free_sched_port_list_lock);
-}

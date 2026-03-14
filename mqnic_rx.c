@@ -4,6 +4,7 @@
  */
 
 #include "mqnic.h"
+#include "meas_skb_helper.h"
 
 struct mqnic_ring *mqnic_create_rx_ring(struct mqnic_if *interface)
 {
@@ -377,6 +378,9 @@ int mqnic_process_rx_cq(struct mqnic_cq *cq, int napi_budget)
 		skb->len = len;
 		skb->data_len = len;
 		skb->truesize += rx_info->len;
+
+		// MEAS timestamp
+		mqnic_meas_stamp_rx_t7(skb);
 
 		// hand off SKB
 		napi_gro_frags(&cq->napi);

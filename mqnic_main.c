@@ -7,7 +7,6 @@
 #include <linux/module.h>
 #include <linux/version.h>
 #include <linux/delay.h>
-#include <linux/idr.h>
 #include <linux/reset.h>
 #include <linux/rtc.h>
 
@@ -56,23 +55,44 @@ static struct of_device_id mqnic_of_id_table[] = {
 MODULE_DEVICE_TABLE(of, mqnic_of_id_table);
 #endif
 
-static DEFINE_IDA(mqnic_instance_ida);
+static LIST_HEAD(mqnic_devices);
+static DEFINE_SPINLOCK(mqnic_devices_lock);
 
-static int mqnic_assign_id(struct mqnic_dev *mqnic)
+static unsigned int mqnic_get_free_id(void)
 {
-	int ret = ida_alloc(&mqnic_instance_ida, GFP_KERNEL);
-	if (ret < 0)
-		return ret;
+	struct mqnic_dev *mqnic;
+	unsigned int id = 0;
+	bool available = false;
 
-	mqnic->id = ret;
+	while (!available) {
+		available = true;
+		list_for_each_entry(mqnic, &mqnic_devices, dev_list_node) {
+			if (mqnic->id == id) {
+				available = false;
+				id++;
+				break;
+			}
+		}
+	}
+
+	return id;
+}
+
+static void mqnic_assign_id(struct mqnic_dev *mqnic)
+{
+	spin_lock(&mqnic_devices_lock);
+	mqnic->id = mqnic_get_free_id();
+	list_add_tail(&mqnic->dev_list_node, &mqnic_devices);
+	spin_unlock(&mqnic_devices_lock);
+
 	snprintf(mqnic->name, sizeof(mqnic->name), DRIVER_NAME "%d", mqnic->id);
-
-	return 0;
 }
 
 static void mqnic_free_id(struct mqnic_dev *mqnic)
 {
-	ida_free(&mqnic_instance_ida, mqnic->id);
+	spin_lock(&mqnic_devices_lock);
+	list_del(&mqnic->dev_list_node);
+	spin_unlock(&mqnic_devices_lock);
 }
 
 static int mqnic_common_setdma(struct mqnic_dev *mqnic)
@@ -223,7 +243,7 @@ static int mqnic_common_probe(struct mqnic_dev *mqnic)
 	struct mqnic_reg_block *rb;
 	struct rtc_time tm;
 
-	int k = 0;
+	int k = 0, l = 0;
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 	devlink_register(devlink);
@@ -370,12 +390,13 @@ static int mqnic_common_probe(struct mqnic_dev *mqnic)
 
 	// pass module I2C clients to interface instances
 	for (k = 0; k < mqnic->if_count; k++) {
-		struct mqnic_priv *priv;
 		struct mqnic_if *interface = mqnic->interface[k];
 		interface->mod_i2c_client = mqnic->mod_i2c_client[k];
 
-		list_for_each_entry(priv, &interface->ndev_list, ndev_list)
+		for (l = 0; l < interface->ndev_count; l++) {
+			struct mqnic_priv *priv = netdev_priv(interface->ndev[l]);
 			priv->mod_i2c_client = mqnic->mod_i2c_client[k];
+		}
 	}
 
 fail_create_if:
@@ -564,10 +585,8 @@ static int mqnic_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent
 	mqnic->pdev = pdev;
 	pci_set_drvdata(pdev, mqnic);
 
-	// assign ID
-	ret = mqnic_assign_id(mqnic);
-	if (ret)
-		goto fail_assign_id;
+	// assign ID and add to list
+	mqnic_assign_id(mqnic);
 
 	// Disable ASPM
 	pci_disable_link_state(pdev, PCIE_LINK_STATE_L0S |
@@ -671,7 +690,6 @@ fail_regions:
 	pci_disable_device(pdev);
 fail_enable_device:
 	mqnic_free_id(mqnic);
-fail_assign_id:
 	mqnic_devlink_free(devlink);
 	return ret;
 }
@@ -739,10 +757,8 @@ static int mqnic_platform_probe(struct platform_device *pdev)
 	mqnic->pfdev = pdev;
 	platform_set_drvdata(pdev, mqnic);
 
-	// assign ID
-	ret = mqnic_assign_id(mqnic);
-	if (ret)
-		goto fail_assign_id;
+	// assign ID and add to list
+	mqnic_assign_id(mqnic);
 
 	// Set DMA properties
 	ret = mqnic_common_setdma(mqnic);
@@ -825,12 +841,11 @@ static int mqnic_platform_probe(struct platform_device *pdev)
 	// error handling
 fail:
 	mqnic_free_id(mqnic);
-fail_assign_id:
 	mqnic_devlink_free(devlink);
 	return ret;
 }
 
-static void mqnic_platform_remove(struct platform_device *pdev)
+static int mqnic_platform_remove(struct platform_device *pdev)
 {
 	struct mqnic_dev *mqnic = platform_get_drvdata(pdev);
 	struct devlink *devlink = priv_to_devlink(mqnic);
@@ -841,25 +856,12 @@ static void mqnic_platform_remove(struct platform_device *pdev)
 
 	mqnic_free_id(mqnic);
 	mqnic_devlink_free(devlink);
-}
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
-static int mqnic_platform_remove_old(struct platform_device *pdev)
-{
-	mqnic_platform_remove(pdev);
 	return 0;
 }
-#endif
 
 static struct platform_driver mqnic_platform_driver = {
 	.probe = mqnic_platform_probe,
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
 	.remove = mqnic_platform_remove,
-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0)
-	.remove_new = mqnic_platform_remove,
-#else
-	.remove = mqnic_platform_remove_old,
-#endif
 	.driver = {
 		.name = DRIVER_NAME,
 		.of_match_table = of_match_ptr(mqnic_of_id_table),
@@ -869,6 +871,12 @@ static struct platform_driver mqnic_platform_driver = {
 static int __init mqnic_init(void)
 {
 	int rc;
+
+#ifdef ENABLE_MEAS
+	printk(KERN_INFO "mqnic: Enabling MEAS measurements\n");
+#else
+	printk(KERN_INFO "mqnic: MEAS measurements disabled\n");
+#endif
 
 #ifdef CONFIG_PCI
 	rc = pci_register_driver(&mqnic_pci_driver);
@@ -896,8 +904,6 @@ static void __exit mqnic_exit(void)
 #ifdef CONFIG_PCI
 	pci_unregister_driver(&mqnic_pci_driver);
 #endif
-
-	ida_destroy(&mqnic_instance_ida);
 }
 
 module_init(mqnic_init);

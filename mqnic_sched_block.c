@@ -58,6 +58,8 @@ struct mqnic_sched_block *mqnic_create_sched_block(struct mqnic_if *interface,
 
 	dev_info(dev, "Scheduler count: %d", block->sched_count);
 
+	mqnic_deactivate_sched_block(block);
+
 	return block;
 
 fail:

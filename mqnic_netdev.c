@@ -13,27 +13,19 @@ int mqnic_start_port(struct net_device *ndev)
 	struct mqnic_if *iface = priv->interface;
 	struct mqnic_ring *q;
 	struct mqnic_cq *cq;
-	struct mqnic_eq *eq;
 	struct radix_tree_iter iter;
 	void **slot;
 	int k;
 	int ret;
 	u32 desc_block_size;
 
-	netdev_info(ndev, "%s on interface %d", __func__, iface->index);
+	netdev_info(ndev, "%s on interface %d netdev %d", __func__,
+			priv->interface->index, priv->index);
 
 	netif_set_real_num_tx_queues(ndev, priv->txq_count);
 	netif_set_real_num_rx_queues(ndev, priv->rxq_count);
 
 	desc_block_size = min_t(u32, priv->interface->max_desc_block_size, 4);
-
-	// allocate scheduler port
-	priv->sched_port = mqnic_interface_alloc_sched_port(iface);
-	if (!priv->sched_port) {
-		netdev_err(ndev, "Failed to allocate scheduler");
-		ret = -ENOMEM;
-		goto fail;
-	}
 
 	// set up RX queues
 	for (k = 0; k < priv->rxq_count; k++) {
@@ -44,11 +36,7 @@ int mqnic_start_port(struct net_device *ndev)
 			goto fail;
 		}
 
-		rcu_read_lock();
-		eq = radix_tree_lookup(&iface->eq_table, k % iface->eq_count);
-		rcu_read_unlock();
-
-		ret = mqnic_open_cq(cq, eq, priv->rx_ring_size);
+		ret = mqnic_open_cq(cq, iface->eq[k % iface->eq_count], priv->rx_ring_size);
 		if (ret) {
 			mqnic_destroy_cq(cq);
 			goto fail;
@@ -103,11 +91,7 @@ int mqnic_start_port(struct net_device *ndev)
 			goto fail;
 		}
 
-		rcu_read_lock();
-		eq = radix_tree_lookup(&iface->eq_table, k % iface->eq_count);
-		rcu_read_unlock();
-
-		ret = mqnic_open_cq(cq, eq, priv->tx_ring_size);
+		ret = mqnic_open_cq(cq, iface->eq[k % iface->eq_count], priv->tx_ring_size);
 		if (ret) {
 			mqnic_destroy_cq(cq);
 			goto fail;
@@ -177,27 +161,8 @@ int mqnic_start_port(struct net_device *ndev)
 
 	mqnic_port_set_tx_ctrl(priv->port, MQNIC_PORT_TX_CTRL_EN);
 
-	// configure scheduler
-	down_read(&priv->txq_table_sem);
-	radix_tree_for_each_slot(slot, &priv->txq_table, &iter, 0) {
-		struct mqnic_ring *q = (struct mqnic_ring *)*slot;
-
-		mqnic_sched_port_queue_set_tc(priv->sched_port, q->index, 0);
-		mqnic_sched_port_queue_enable(priv->sched_port, q->index);
-	}
-	up_read(&priv->txq_table_sem);
-
-	// configure scheduler flow control
-	mqnic_sched_port_channel_set_dest(priv->sched_port, 0, (priv->port->index << 4) | 0);
-	mqnic_sched_port_channel_set_pkt_budget(priv->sched_port, 0, 1);
-	mqnic_sched_port_channel_set_data_budget(priv->sched_port, 0, ndev->mtu + ETH_HLEN);
-	mqnic_sched_port_channel_set_pkt_limit(priv->sched_port, 0, 0xFFFF);
-	mqnic_sched_port_channel_set_data_limit(priv->sched_port, 0, iface->tx_fifo_depth);
-
-	mqnic_sched_port_channel_enable(priv->sched_port, 0);
-
 	// enable scheduler
-	mqnic_sched_port_enable(priv->sched_port);
+	mqnic_activate_sched_block(priv->sched_block);
 
 	netif_tx_start_all_queues(ndev);
 	netif_device_attach(ndev);
@@ -226,7 +191,8 @@ void mqnic_stop_port(struct net_device *ndev)
 	struct radix_tree_iter iter;
 	void **slot;
 
-	netdev_info(ndev, "%s on interface %d", __func__, priv->interface->index);
+	netdev_info(ndev, "%s on interface %d netdev %d", __func__,
+			priv->interface->index, priv->index);
 
 	if (mqnic_link_status_poll)
 		del_timer_sync(&priv->link_status_timer);
@@ -246,18 +212,8 @@ void mqnic_stop_port(struct net_device *ndev)
 	mqnic_update_stats(ndev);
 	spin_unlock_bh(&priv->stats_lock);
 
-	if (priv->sched_port) {
-		down_read(&priv->txq_table_sem);
-		radix_tree_for_each_slot(slot, &priv->txq_table, &iter, 0) {
-			struct mqnic_ring *q = (struct mqnic_ring *)*slot;
-
-			mqnic_sched_port_queue_disable(priv->sched_port, q->index);
-		}
-		up_read(&priv->txq_table_sem);
-
-		mqnic_sched_port_channel_disable(priv->sched_port, 0);
-		mqnic_sched_port_disable(priv->sched_port);
-	}
+	// disable scheduler
+	mqnic_deactivate_sched_block(priv->sched_block);
 
 	// disable TX and RX queues
 	down_read(&priv->txq_table_sem);
@@ -312,11 +268,6 @@ void mqnic_stop_port(struct net_device *ndev)
 		mqnic_destroy_cq(cq);
 	}
 	up_write(&priv->rxq_table_sem);
-
-	// free scheduler port
-	if (priv->sched_port)
-		mqnic_interface_free_sched_port(priv->interface, priv->sched_port);
-	priv->sched_port = NULL;
 }
 
 static int mqnic_open(struct net_device *ndev)
@@ -330,8 +281,8 @@ static int mqnic_open(struct net_device *ndev)
 	ret = mqnic_start_port(ndev);
 
 	if (ret)
-		netdev_err(ndev, "Failed to start port on interface %d: %d",
-				priv->interface->index, ret);
+		netdev_err(ndev, "Failed to start port on interface %d netdev %d: %d",
+				priv->interface->index, priv->index, ret);
 
 	mutex_unlock(&mdev->state_lock);
 	return ret;
@@ -358,8 +309,8 @@ int mqnic_update_indir_table(struct net_device *ndev)
 	struct mqnic_ring *q;
 	int k;
 
-	mqnic_interface_set_rx_queue_map_rss_mask(iface, priv->port->index, 0xffffffff);
-	mqnic_interface_set_rx_queue_map_app_mask(iface, priv->port->index, 0);
+	mqnic_interface_set_rx_queue_map_rss_mask(iface, 0, 0xffffffff);
+	mqnic_interface_set_rx_queue_map_app_mask(iface, 0, 0);
 
 	for (k = 0; k < priv->rx_queue_map_indir_table_size; k++) {
 		rcu_read_lock();
@@ -367,7 +318,7 @@ int mqnic_update_indir_table(struct net_device *ndev)
 		rcu_read_unlock();
 
 		if (q)
-			mqnic_interface_set_rx_queue_map_indir_table(iface, priv->port->index, k, q->index);
+			mqnic_interface_set_rx_queue_map_indir_table(iface, 0, k, q->index);
 	}
 
 	return 0;
@@ -489,24 +440,6 @@ static int mqnic_hwtstamp_get(struct net_device *ndev, struct ifreq *ifr)
 	return 0;
 }
 
-static int mqnic_set_mac(struct net_device *ndev, void *addr)
-{
-	struct sockaddr *saddr = addr;
-
-	if (!is_valid_ether_addr(saddr->sa_data))
-		return -EADDRNOTAVAIL;
-
-	netif_addr_lock_bh(ndev);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
-	eth_hw_addr_set(ndev, saddr->sa_data);
-#else
-	memcpy(ndev->dev_addr, saddr->sa_data, ETH_ALEN);
-#endif
-	netif_addr_unlock_bh(ndev);
-
-	return 0;
-}
-
 static int mqnic_change_mtu(struct net_device *ndev, int new_mtu)
 {
 	struct mqnic_priv *priv = netdev_priv(ndev);
@@ -559,7 +492,6 @@ static const struct net_device_ops mqnic_netdev_ops = {
 	.ndo_start_xmit = mqnic_start_xmit,
 	.ndo_get_stats64 = mqnic_get_stats64,
 	.ndo_validate_addr = eth_validate_addr,
-	.ndo_set_mac_address = mqnic_set_mac,
 	.ndo_change_mtu = mqnic_change_mtu,
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
 	.ndo_eth_ioctl = mqnic_ioctl,
@@ -596,7 +528,8 @@ static void mqnic_link_status_timeout(struct timer_list *timer)
 	mod_timer(&priv->link_status_timer, jiffies + msecs_to_jiffies(mqnic_link_status_poll));
 }
 
-struct net_device *mqnic_create_netdev(struct mqnic_if *interface, struct mqnic_port *port)
+struct net_device *mqnic_create_netdev(struct mqnic_if *interface, int index,
+		struct mqnic_port *port, struct mqnic_sched_block *sched_block)
 {
 	struct mqnic_dev *mdev = interface->mdev;
 	struct device *dev = interface->dev;
@@ -630,15 +563,16 @@ struct net_device *mqnic_create_netdev(struct mqnic_if *interface, struct mqnic_
 	priv->dl_port = &port->dl_port;
 	priv->interface = interface;
 	priv->dev = dev;
+	priv->index = index;
 	priv->port = port;
 	priv->port_up = false;
-	priv->sched_port = NULL;
+	priv->sched_block = sched_block;
 
 	// associate interface resources
 	priv->if_features = interface->if_features;
 
-	priv->txq_count = min_t(u32, mqnic_res_get_count(interface->txq_res) / interface->port_count, 256);
-	priv->rxq_count = min_t(u32, mqnic_res_get_count(interface->rxq_res) / interface->port_count, num_online_cpus());
+	priv->txq_count = min_t(u32, mqnic_res_get_count(interface->txq_res), 256);
+	priv->rxq_count = min_t(u32, mqnic_res_get_count(interface->rxq_res), num_online_cpus());
 
 	priv->tx_ring_size = roundup_pow_of_two(clamp_t(u32, mqnic_num_txq_entries,
 			MQNIC_MIN_TX_RING_SZ, MQNIC_MAX_TX_RING_SZ));
@@ -717,8 +651,8 @@ struct net_device *mqnic_create_netdev(struct mqnic_if *interface, struct mqnic_
 
 	ret = register_netdev(ndev);
 	if (ret) {
-		dev_err(dev, "netdev registration failed on interface %d: %d",
-				priv->interface->index, ret);
+		dev_err(dev, "netdev registration failed on interface %d netdev %d: %d",
+				priv->interface->index, priv->index, ret);
 		goto fail;
 	}
 

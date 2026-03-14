@@ -5,6 +5,7 @@
 
 #include <linux/version.h>
 #include "mqnic.h"
+#include "meas_skb_helper.h"
 
 struct mqnic_ring *mqnic_create_tx_ring(struct mqnic_if *interface)
 {
@@ -421,13 +422,6 @@ netdev_tx_t mqnic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		// unknown TX queue
 		goto tx_drop;
 
-	if (skb->len < ETH_HLEN) {
-		netdev_warn(priv->ndev, "%s: ring %d dropping short frame (length %d)",
-				__func__, ring->index, skb->len);
-		ring->dropped_packets++;
-		goto tx_drop_count;
-	}
-
 	cons_ptr = READ_ONCE(ring->cons_ptr);
 
 	// prefetch for BQL
@@ -447,6 +441,8 @@ netdev_tx_t mqnic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 		tx_info->ts_requested = 1;
 	}
 
+	mqnic_meas_stamp_tx_t2(skb);
+
 	// TX hardware checksum
 	if (skb->ip_summed == CHECKSUM_PARTIAL) {
 		unsigned int csum_start = skb_checksum_start_offset(skb);
@@ -461,12 +457,12 @@ netdev_tx_t mqnic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 				// software checksumming failed
 				goto tx_drop_count;
 			}
-			tx_desc->tx.csum_cmd = 0;
+			tx_desc->tx_csum_cmd = 0;
 		} else {
-			tx_desc->tx.csum_cmd = cpu_to_le16(0x8000 | (csum_offset << 8) | (csum_start));
+			tx_desc->tx_csum_cmd = cpu_to_le16(0x8000 | (csum_offset << 8) | (csum_start));
 		}
 	} else {
-		tx_desc->tx.csum_cmd = 0;
+		tx_desc->tx_csum_cmd = 0;
 	}
 
 	if (shinfo->nr_frags > ring->desc_block_size - 1 || (skb->data_len && skb->data_len < 32)) {
@@ -491,7 +487,8 @@ netdev_tx_t mqnic_start_xmit(struct sk_buff *skb, struct net_device *ndev)
 
 	stop_queue = mqnic_is_tx_ring_full(ring);
 	if (unlikely(stop_queue)) {
-		netdev_dbg(ndev, "%s: TX ring %d full", __func__, ring_index);
+		netdev_dbg(ndev, "%s: TX ring %d full on port %d",
+				__func__, ring_index, priv->index);
 		netif_tx_stop_queue(ring->tx_queue);
 	}
 

@@ -15,7 +15,6 @@ mqnic-y += mqnic_if.o
 mqnic-y += mqnic_port.o
 mqnic-y += mqnic_netdev.o
 mqnic-y += mqnic_sched_block.o
-mqnic-y += mqnic_sched_port.o
 mqnic-y += mqnic_scheduler.o
 mqnic-y += mqnic_ptp.o
 mqnic-y += mqnic_i2c.o
@@ -28,8 +27,14 @@ mqnic-y += mqnic_cq.o
 mqnic-y += mqnic_eq.o
 mqnic-y += mqnic_ethtool.o
 
+ccflags-y += -I$(src)/include
+
 ifneq ($(DEBUG),)
 ccflags-y += -DDEBUG
+endif
+
+ifneq ($(ENABLE_MEAS),)
+ccflags-y += -DENABLE_MEAS
 endif
 
 else
